@@ -3,10 +3,11 @@
 mod data_io;
 mod handshake;
 mod heartbeat;
+mod v2_path;
 
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::protocol::zmtp::greeting::ZmtpGreeting;
+use crate::protocol::zmtp::greeting::{NegotiatedVersion, ZmtpGreeting};
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::security::framer::{ISecureFramer, NullFramer};
 use crate::security::{Mechanism, NullMechanism};
@@ -41,6 +42,12 @@ pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   pub(crate) handshake_state: ZmtpHandshakeStateX,
   pub(crate) security_mechanism: Box<dyn Mechanism>,
   pub(crate) pending_peer_greeting: Option<ZmtpGreeting>,
+  /// Set during the staged greeting once we know which ZMTP version
+  /// the peer is speaking. `None` before the peek; `Some` for the rest
+  /// of the handshake and the entire data phase. Downstream code keys
+  /// off this to disable v3-only behaviours (security tokens, READY
+  /// exchange, PING/PONG, COMMAND-flagged frames) on v2 sessions.
+  pub(crate) negotiated_version: Option<NegotiatedVersion>,
   pub(crate) zmtp_manual_parser: ZmtpManualParser, // For the handshake phase
   pub(crate) framer: Box<dyn ISecureFramer>,       // For the data phase
 
@@ -119,6 +126,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       handshake_state: ZmtpHandshakeStateX::new(),
       security_mechanism: Box::new(NullMechanism),
       pending_peer_greeting: None,
+      negotiated_version: None,
       zmtp_manual_parser: ZmtpManualParser::new(max_msg_size),
       framer: Box::new(NullFramer::new(max_msg_size)),
       heartbeat_state: ZmtpHeartbeatStateX::new(
@@ -257,6 +265,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     );
 
     self.pending_peer_greeting = None;
+    self.negotiated_version = None;
     self.network_read_buffer.clear();
 
     // Reset security mechanism to free any internal buffers

@@ -5,7 +5,10 @@ use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::protocol::zmtp::ZmtpCodec;
 use crate::protocol::zmtp::command::{ZmtpCommand, ZmtpReady};
-use crate::protocol::zmtp::greeting::{GREETING_LENGTH, ZmtpGreeting};
+use crate::protocol::zmtp::greeting::{
+  GREETING_LENGTH, GREETING_VERSION_MAJOR_BYTE, NegotiatedVersion, SIGNATURE_LENGTH, ZmtpGreeting,
+  ZmtpV2Greeting, encode_signature, encode_v3_tail_post_major, peek_revision, socket_type_code,
+};
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
 #[cfg(feature = "plain")]
@@ -14,7 +17,7 @@ use crate::security::mechanism::ProcessTokenAction;
 use crate::security::{NullMechanism, negotiate_security_mechanism};
 use crate::transport::ZmtpStdStream;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,7 +33,10 @@ pub(crate) async fn advance_handshake_step_impl<S: ZmtpStdStream>(
   let operation_timeout = handler.config.handshake_timeout.unwrap_or(Duration::from_secs(15));
 
   match handler.handshake_state.sub_phase {
-    HandshakeSubPhaseX::GreetingExchange => send_greeting_impl(handler, operation_timeout).await,
+    HandshakeSubPhaseX::GreetingExchange => send_signature_impl(handler, operation_timeout).await,
+    HandshakeSubPhaseX::WaitingForPeerRevision => {
+      wait_for_peer_revision_impl(handler, operation_timeout).await
+    }
     HandshakeSubPhaseX::WaitingForGreeting => receive_greeting_impl(handler, operation_timeout).await,
     HandshakeSubPhaseX::SecurityHandshake => {
       perform_security_handshake_step_impl(handler, operation_timeout).await
@@ -43,6 +49,9 @@ pub(crate) async fn advance_handshake_step_impl<S: ZmtpStdStream>(
     }
     HandshakeSubPhaseX::ServerReceivedReady => {
       server_send_ready_impl(handler, operation_timeout).await
+    }
+    HandshakeSubPhaseX::V2IdentityExchange => {
+      perform_v2_identity_exchange_impl(handler, operation_timeout).await
     }
     HandshakeSubPhaseX::Done => Ok(ZmtpHandshakeProgressX::HandshakeComplete),
   }
@@ -139,45 +148,220 @@ async fn send_handshake_command_frame_impl<S: ZmtpStdStream>(
   Ok(())
 }
 
-/// Sends our local ZMTP greeting and transitions to `WaitingForGreeting`.
-/// Clears `network_read_buffer` here so that `receive_greeting_impl` can safely
-/// accumulate partial reads across cancellations without losing bytes.
-async fn send_greeting_impl<S: ZmtpStdStream>(
+/// Stage A of the staged greeting: write `signature(10) + 0x03` —
+/// the 10-byte ZMTP signature followed immediately by our own major
+/// version byte. Then transition to `WaitingForPeerRevision`.
+///
+/// This is exactly libzmq's behaviour. Byte 10 is *always* the
+/// sender's own major version — it is not a "downgrade request" and
+/// is not version-dependent, so it is safe to send before learning
+/// anything about the peer:
+///
+/// - a v3 peer reads `0x03` and is satisfied;
+/// - a v2-only peer reads `0x03`, treats it as "remote is ≥ v2", and
+///   caps the session at its own max (v2) — it does not reject it.
+///
+/// Only the bytes from offset 11 onward differ between v2 and v3, and
+/// those are held back until `WaitingForPeerRevision` has seen the
+/// peer's byte 10. Because every installment a peer needs to advance
+/// (signature, then byte 10) is sent unconditionally before any
+/// version-dependent byte, two rzmq peers doing this dance never
+/// deadlock — no negotiation timeout is required.
+async fn send_signature_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
   operation_timeout: Duration,
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
-  let own_greeting_mechanism_bytes = determine_own_greeting_mechanism_impl(handler);
   let stream = handler
     .stream
     .as_mut()
     .ok_or_else(|| ZmqError::Internal("Stream unavailable".into()))?;
-  let mut greeting_buffer_to_send = BytesMut::with_capacity(GREETING_LENGTH);
-  ZmtpGreeting::encode(
-    own_greeting_mechanism_bytes,
-    handler.is_server,
-    &mut greeting_buffer_to_send,
-  );
-  tokio::time::timeout(
-    operation_timeout,
-    stream.write_all(&greeting_buffer_to_send),
-  )
-  .await
-  .map_err(|_| ZmqError::Timeout)?
-  .map_err(|e| ZmqError::from_io_endpoint(e, "g send"))?;
+
+  // Signature (10 bytes) + our major version byte (0x03).
+  let mut prelude = BytesMut::with_capacity(SIGNATURE_LENGTH + 1);
+  encode_signature(&mut prelude);
+  prelude.put_u8(GREETING_VERSION_MAJOR_BYTE);
+
+  tokio::time::timeout(operation_timeout, stream.write_all(&prelude))
+    .await
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "g sig send"))?;
   tokio::time::timeout(operation_timeout, stream.flush())
     .await
     .map_err(|_| ZmqError::Timeout)?
-    .map_err(|e| ZmqError::from_io_endpoint(e, "g flush"))?;
+    .map_err(|e| ZmqError::from_io_endpoint(e, "g sig flush"))?;
+
   handler.heartbeat_state.record_activity();
   tracing::debug!(
     sca_handle = handler.actor_handle,
     role = if handler.is_server { "S" } else { "C" },
-    "Sent ZMTP greeting."
+    "Sent ZMTP signature + major version (11 bytes); awaiting peer revision."
   );
+
+  // We're about to read into network_read_buffer. Clear it so reads of
+  // the peer's signature+revision don't accidentally pick up stale
+  // bytes from a prior cancelled handshake.
   handler.network_read_buffer.clear();
   if handler.network_read_buffer.capacity() < GREETING_LENGTH {
     handler.network_read_buffer.reserve(GREETING_LENGTH);
   }
+  handler.handshake_state.sub_phase = HandshakeSubPhaseX::WaitingForPeerRevision;
+  Ok(ZmtpHandshakeProgressX::InProgress)
+}
+
+/// Stage B of the staged greeting: read until we have the peer's first
+/// 11 bytes (signature + revision), inspect byte 10, then write our
+/// version-dependent tail and transition to the appropriate state.
+///
+/// - peer revision `0x01` ⇒ write our v2 tail (1 byte: socket-type)
+///   and jump to `V2IdentityExchange`. `negotiated_version` ← `V2`.
+/// - peer revision `0x03+` ⇒ write our v3 tail (53 bytes) and continue
+///   into `WaitingForGreeting`. `negotiated_version` is set to
+///   `V3 { minor }` once we've seen the full v3 greeting.
+/// - any other revision ⇒ `ProtocolViolation`. ZMTP/1.0 framing is
+///   different enough that we intentionally don't try to negotiate it.
+async fn wait_for_peer_revision_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+) -> Result<ZmtpHandshakeProgressX, ZmqError> {
+  const PEEK_LEN: usize = SIGNATURE_LENGTH + 1; // 11 bytes — signature + byte 10
+
+  let peer_revision =
+    read_peer_signature_and_peek_revision(handler, operation_timeout, PEEK_LEN).await?;
+  tracing::debug!(
+    sca_handle = handler.actor_handle,
+    role = if handler.is_server { "S" } else { "C" },
+    peer_revision = format_args!("{:#04x}", peer_revision),
+    "Peeked peer revision byte; selecting greeting tail."
+  );
+  match peer_revision {
+    ZmtpV2Greeting::REVISION => write_v2_tail_and_advance(handler, operation_timeout).await,
+    v if v >= GREETING_VERSION_MAJOR_BYTE => {
+      write_v3_tail_and_advance(handler, operation_timeout).await
+    }
+    other => Err(ZmqError::ProtocolViolation(format!(
+      "Unsupported ZMTP revision {:#04x} (only 0x01 and 0x03+ are supported)",
+      other
+    ))),
+  }
+}
+
+/// Read from the stream until `network_read_buffer` holds at least
+/// `peek_len` bytes, then validate the ZMTP signature and return the
+/// revision byte at offset 10. Bounded by `operation_timeout`; no
+/// shorter fallback is needed because the peer always sends its
+/// signature + byte 10 unconditionally (see `send_signature_impl`).
+async fn read_peer_signature_and_peek_revision<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+  peek_len: usize,
+) -> Result<u8, ZmqError> {
+  let deadline = Instant::now() + operation_timeout;
+  let stream = handler
+    .stream
+    .as_mut()
+    .ok_or_else(|| ZmqError::Internal("Stream unavailable".into()))?;
+
+  while handler.network_read_buffer.len() < peek_len {
+    let remaining_time = deadline.saturating_duration_since(Instant::now());
+    if remaining_time.is_zero() {
+      return Err(ZmqError::Timeout);
+    }
+    let br = tokio::time::timeout(
+      remaining_time,
+      stream.read_buf(&mut handler.network_read_buffer),
+    )
+    .await
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "g peek read"))?;
+    if br == 0 {
+      return Err(ZmqError::ConnectionClosed);
+    }
+    handler.heartbeat_state.record_activity();
+  }
+  // peek_revision validates signature bytes 0..9 and returns byte 10.
+  peek_revision(&handler.network_read_buffer[..peek_len])
+}
+
+/// Write our 1-byte v2 tail — the socket-type byte at offset 11.
+/// Byte 10 (our major version `0x03`) was already sent with the
+/// signature in `send_signature_impl`, so the greeting on the wire
+/// ends up as `signature(10) + 0x03 + socket_type` = 12 bytes. This
+/// matches libzmq, whose downgraded greeting also carries `0x03` at
+/// byte 10; a v2 peer keys the session version off its *own* offered
+/// revision, not off ours. Transitions to `V2IdentityExchange`.
+async fn write_v2_tail_and_advance<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+) -> Result<ZmtpHandshakeProgressX, ZmqError> {
+  if !handler.config.allow_zmtp2 {
+    return Err(ZmqError::ProtocolViolation(
+      "peer advertised ZMTP/2.0 but allow_zmtp2 is disabled".into(),
+    ));
+  }
+  let stype_byte = socket_type_code(&handler.config.socket_type_name).ok_or_else(|| {
+    ZmqError::ProtocolViolation(format!(
+      "no ZMTP/2.0 socket-type byte for socket type {:?}",
+      handler.config.socket_type_name
+    ))
+  })?;
+  let mut tail = BytesMut::with_capacity(1);
+  tail.put_u8(stype_byte);
+
+  let stream = handler
+    .stream
+    .as_mut()
+    .ok_or_else(|| ZmqError::Internal("Stream unavailable".into()))?;
+  tokio::time::timeout(operation_timeout, stream.write_all(&tail))
+    .await
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "g v2 tail send"))?;
+  tokio::time::timeout(operation_timeout, stream.flush())
+    .await
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "g v2 tail flush"))?;
+
+  handler.negotiated_version = Some(NegotiatedVersion::V2);
+  tracing::info!(
+    sca_handle = handler.actor_handle,
+    socket_type = %handler.config.socket_type_name,
+    socket_type_code = stype_byte,
+    "Downgraded to ZMTP/2.0 after peer advertised revision 0x01."
+  );
+  handler.handshake_state.sub_phase = HandshakeSubPhaseX::V2IdentityExchange;
+  Ok(ZmtpHandshakeProgressX::InProgress)
+}
+
+/// Write our 53-byte v3 tail — bytes 11..63 of the greeting: minor +
+/// 20-byte mechanism + as-server + 31 padding. Byte 10 (major `0x03`)
+/// was already sent with the signature in `send_signature_impl`, so
+/// the complete greeting on the wire is 64 bytes. Transitions to
+/// `WaitingForGreeting`.
+async fn write_v3_tail_and_advance<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+) -> Result<ZmtpHandshakeProgressX, ZmqError> {
+  let mech = determine_own_greeting_mechanism_impl(handler);
+  let is_server = handler.is_server;
+  let mut tail = BytesMut::with_capacity(GREETING_LENGTH - SIGNATURE_LENGTH - 1);
+  encode_v3_tail_post_major(mech, is_server, &mut tail);
+
+  let stream = handler
+    .stream
+    .as_mut()
+    .ok_or_else(|| ZmqError::Internal("Stream unavailable".into()))?;
+  tokio::time::timeout(operation_timeout, stream.write_all(&tail))
+    .await
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "g v3 tail send"))?;
+  tokio::time::timeout(operation_timeout, stream.flush())
+    .await
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "g v3 tail flush"))?;
+
+  tracing::debug!(
+    sca_handle = handler.actor_handle,
+    "Sent v3 greeting tail (53 bytes); awaiting full peer greeting."
+  );
   handler.handshake_state.sub_phase = HandshakeSubPhaseX::WaitingForGreeting;
   Ok(ZmtpHandshakeProgressX::InProgress)
 }
@@ -213,11 +397,16 @@ async fn receive_greeting_impl<S: ZmtpStdStream>(
   match ZmtpGreeting::decode(&mut handler.network_read_buffer) {
     Ok(Some(pg)) => {
       if pg.version.0 < 3 {
+        // Shouldn't happen — staged greeting would have caught a v2
+        // peer in `WaitingForPeerRevision`. Treat as a protocol bug.
         return Err(ZmqError::ProtocolViolation(format!(
           "V {}.{}",
           pg.version.0, pg.version.1
         )));
       }
+      handler.negotiated_version = Some(NegotiatedVersion::V3 {
+        minor: pg.version.1,
+      });
       handler.pending_peer_greeting = Some(pg);
       handler.handshake_state.sub_phase = HandshakeSubPhaseX::SecurityHandshake;
       Ok(ZmtpHandshakeProgressX::InProgress)
@@ -225,6 +414,16 @@ async fn receive_greeting_impl<S: ZmtpStdStream>(
     Ok(None) => Err(ZmqError::ProtocolViolation("g decode".into())),
     Err(e) => Err(e),
   }
+}
+
+/// Phase 3 entry point — performs the ZMTP/2.0 identity exchange and
+/// transitions the handshake state machine to `Done`. Implemented in
+/// the v2-path module.
+async fn perform_v2_identity_exchange_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+) -> Result<ZmtpHandshakeProgressX, ZmqError> {
+  super::v2_path::exchange_v2_identity(handler, operation_timeout).await
 }
 
 fn determine_own_greeting_mechanism_impl<S: ZmtpStdStream>(

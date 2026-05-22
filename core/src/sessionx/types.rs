@@ -39,9 +39,18 @@ pub(crate) enum ZmtpHandshakeProgressX {
 /// Internal sub-phases for ZmtpProtocolHandlerX's handshake state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HandshakeSubPhaseX {
-  /// Sending our local greeting to the peer.
+  /// Sending the 10-byte ZMTP signature to the peer. This is Stage A of
+  /// the staged-greeting dance — libzmq writes 10 bytes and waits for
+  /// the peer's revision byte before deciding which tail to send.
   GreetingExchange,
-  /// Greeting sent; waiting to receive the peer's greeting.
+  /// Signature sent; reading the peer's first 11 bytes so we can peek
+  /// byte 10 (the revision) and decide whether to write our v2 or v3
+  /// tail. Once we have ≥11 bytes, we write our tail and transition to
+  /// either `WaitingForGreeting` (v3) or `V2IdentityExchange` (v2).
+  WaitingForPeerRevision,
+  /// Tail sent; reading the rest of the peer's v3 greeting (bytes
+  /// 11..63). Some bytes may already be in the read buffer from the
+  /// peek.
   WaitingForGreeting,
   SecurityHandshake,
   /// About to do READY exchange: client sends first, server receives first.
@@ -50,5 +59,9 @@ pub(crate) enum HandshakeSubPhaseX {
   ClientSentReady,
   /// Server has received the client's READY; needs to send its own READY.
   ServerReceivedReady,
+  /// ZMTP/2.0 path: exchange empty identity frames with the peer, then
+  /// transition straight to `Done`. There is no security handshake or
+  /// READY exchange in v2.
+  V2IdentityExchange,
   Done,
 }
