@@ -11,8 +11,14 @@ use crate::io_uring_backend::worker::MultishotReader;
 use crate::message::{Msg, MsgFlags};
 use crate::protocol::zmtp::{
   command::{ZmtpCommand, ZmtpReady},
-  greeting::{GREETING_LENGTH, MECHANISM_LENGTH, ZmtpGreeting},
-  manual_parser::ZmtpManualParser,
+  greeting::{
+    GREETING_LENGTH, GREETING_VERSION_MAJOR_BYTE, MECHANISM_LENGTH, NegotiatedVersion,
+    SIGNATURE_LENGTH, V2_GREETING_LENGTH, V2_SOCKET_TYPE_DEALER, V2_SOCKET_TYPE_PAIR,
+    V2_SOCKET_TYPE_PUB, V2_SOCKET_TYPE_PULL, V2_SOCKET_TYPE_PUSH, V2_SOCKET_TYPE_REP,
+    V2_SOCKET_TYPE_REQ, V2_SOCKET_TYPE_ROUTER, V2_SOCKET_TYPE_SUB, ZmtpGreeting, ZmtpV2Greeting,
+    encode_signature, encode_v3_tail_post_major, peek_revision, socket_type_code,
+    socket_type_name_from_code,
+  },
 };
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
@@ -39,10 +45,27 @@ const ZC_SEND_THRESHOLD: usize = 1024;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ZmtpHandlerPhase {
   Initial,
-  ClientSendGreeting,
-  ClientWaitServerGreeting,
-  ServerWaitClientGreeting,
-  ServerSendGreeting,
+  /// Staged greeting stage A: sent `signature + 0x03` (11 bytes),
+  /// awaiting the send ACK. Symmetric for both roles, exactly like
+  /// libzmq — byte 10 is always the sender's own major version.
+  SendSignature,
+  /// Staged greeting stage B: reading the peer's first 11 bytes
+  /// (signature + revision byte) to learn which tail to send.
+  WaitPeerRevision,
+  /// Sent our 53-byte v3 greeting tail, awaiting the send ACK.
+  SendV3Tail,
+  /// Reading the peer's full 64-byte v3 greeting.
+  WaitV3Greeting,
+  /// Sent our 1-byte v2 greeting tail (socket-type), awaiting the
+  /// send ACK.
+  SendV2Tail,
+  /// Reading the peer's 12th greeting byte, validating socket-type
+  /// compatibility, then sending our empty v2 identity frame.
+  V2GreetingExchange,
+  /// Sent our empty v2 identity frame, awaiting the send ACK.
+  V2SendIdentity,
+  /// Reading the peer's v2 identity frame.
+  V2WaitIdentity,
   SecurityExchange,
   ReadyClientSend,
   ReadyClientWaitServer,
@@ -84,6 +107,12 @@ pub struct ZmtpUringHandler {
 
   last_sent_was_ping: bool,
   multishot_reader: Option<MultishotReader>,
+
+  /// The ZMTP wire revision settled on by the staged greeting. `None`
+  /// until `WaitPeerRevision` peeks the peer's byte 10. Downstream
+  /// code branches on this to reject COMMAND frames and suppress
+  /// PING/PONG on ZMTP/2.0 sessions.
+  negotiated_version: Option<NegotiatedVersion>,
 }
 
 impl ZmtpUringHandler {
@@ -122,6 +151,7 @@ impl ZmtpUringHandler {
       final_peer_identity: None,
       last_sent_was_ping: false,
       multishot_reader: None,
+      negotiated_version: None,
     }
   }
 
@@ -266,16 +296,105 @@ impl ZmtpUringHandler {
         }
 
         // Phases where this function primarily waits for send completions, not for processing read data.
-        ZmtpHandlerPhase::ClientSendGreeting
-        | ZmtpHandlerPhase::ServerSendGreeting
+        ZmtpHandlerPhase::SendSignature
+        | ZmtpHandlerPhase::SendV3Tail
+        | ZmtpHandlerPhase::SendV2Tail
+        | ZmtpHandlerPhase::V2SendIdentity
         | ZmtpHandlerPhase::ReadyClientSend
         | ZmtpHandlerPhase::ReadyServerSend => {
           trace!(fd=self.fd, phase=?self.phase, "ProcessBufferedReads: In a 'Send' phase, primarily waiting for send ACK. No read processing.");
           break 'phase_processing_loop; // No read processing in these states from this function
         }
 
-        // Greeting Exchange (Server waiting for Client's Greeting)
-        ZmtpHandlerPhase::ServerWaitClientGreeting => {
+        // Staged greeting stage B: read the peer's first 11 bytes
+        // (signature + revision), then send the version-dependent tail.
+        ZmtpHandlerPhase::WaitPeerRevision => {
+          const PEEK_LEN: usize = SIGNATURE_LENGTH + 1; // 11 bytes
+          let needed = PEEK_LEN.saturating_sub(self.greeting_buffer.len());
+          if needed > 0 {
+            let source_buf = &mut self.network_read_accumulator;
+            let can_take = std::cmp::min(needed, source_buf.len());
+            if can_take > 0 {
+              self.greeting_buffer.put(source_buf.split_to(can_take));
+              progress_this_iteration = true;
+            }
+            if self.greeting_buffer.len() < PEEK_LEN {
+              break 'phase_processing_loop; /* Need more data for the peek */
+            }
+          }
+
+          let peer_revision = match peek_revision(&self.greeting_buffer[..PEEK_LEN]) {
+            Ok(r) => r,
+            Err(e) => {
+              self.transition_to_error(ops, e.clone(), interface);
+              return Err(e);
+            }
+          };
+          debug!(
+            fd = self.fd,
+            peer_revision = format_args!("{:#04x}", peer_revision),
+            "WaitPeerRevision: peeked peer revision byte."
+          );
+          progress_this_iteration = true;
+
+          if peer_revision == ZmtpV2Greeting::REVISION {
+            if !self.zmtp_config.allow_zmtp2 {
+              let err = ZmqError::ProtocolViolation(
+                "peer advertised ZMTP/2.0 but allow_zmtp2 is disabled".into(),
+              );
+              self.transition_to_error(ops, err.clone(), interface);
+              return Err(err);
+            }
+            let stype_byte = match socket_type_code(&self.zmtp_config.socket_type_name) {
+              Some(b) => b,
+              None => {
+                let err = ZmqError::ProtocolViolation(format!(
+                  "no ZMTP/2.0 socket-type byte for socket type {:?}",
+                  self.zmtp_config.socket_type_name
+                ));
+                self.transition_to_error(ops, err.clone(), interface);
+                return Err(err);
+              }
+            };
+            // v2 tail is a single byte (the socket-type) — byte 10
+            // (0x03) was already sent with the signature.
+            ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
+              data: Bytes::copy_from_slice(&[stype_byte]),
+              send_op_flags: 0,
+              originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+            });
+            self.negotiated_version = Some(NegotiatedVersion::V2);
+            info!(
+              fd = self.fd,
+              socket_type = %self.zmtp_config.socket_type_name,
+              "Downgrading to ZMTP/2.0 after peer advertised revision 0x01."
+            );
+            self.phase = ZmtpHandlerPhase::SendV2Tail;
+          } else if peer_revision >= GREETING_VERSION_MAJOR_BYTE {
+            let mech = self
+              .zmtp_config
+              .security_mechanism_bytes_to_propose(self.is_server);
+            let mut tail = BytesMut::with_capacity(GREETING_LENGTH - SIGNATURE_LENGTH - 1);
+            encode_v3_tail_post_major(mech, self.is_server, &mut tail);
+            ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
+              data: tail.freeze(),
+              send_op_flags: 0,
+              originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+            });
+            self.phase = ZmtpHandlerPhase::SendV3Tail;
+          } else {
+            let err = ZmqError::ProtocolViolation(format!(
+              "Unsupported ZMTP revision {:#04x} (only 0x01 and 0x03+ are supported)",
+              peer_revision
+            ));
+            self.transition_to_error(ops, err.clone(), interface);
+            return Err(err);
+          }
+        }
+
+        // Read the peer's full 64-byte v3 greeting (we already hold the
+        // first 11 bytes from the peek). Symmetric for both roles.
+        ZmtpHandlerPhase::WaitV3Greeting => {
           let needed_for_greeting = GREETING_LENGTH.saturating_sub(self.greeting_buffer.len());
           if needed_for_greeting > 0 {
             let source_buf = &mut self.network_read_accumulator;
@@ -294,15 +413,18 @@ impl ZmtpUringHandler {
               progress_this_iteration = true;
               debug!(
                 fd = self.fd,
-                role = "S",
+                role = if self.is_server { "S" } else { "C" },
                 ?peer_greeting,
-                "Received and decoded client greeting"
+                "Received and decoded peer v3 greeting"
               );
               if self.is_server == peer_greeting.as_server {
                 let err = ZmqError::SecurityError("Role mismatch in greeting".into());
                 self.transition_to_error(ops, err.clone(), interface);
                 return Err(err);
               }
+              self.negotiated_version = Some(NegotiatedVersion::V3 {
+                minor: peer_greeting.version.1,
+              });
               self.security_mechanism = Some(negotiate_security_mechanism(
                 self.is_server,
                 &self.zmtp_config,
@@ -310,22 +432,9 @@ impl ZmtpUringHandler {
                 self.fd as usize,
               )?);
               info!(fd=self.fd, mechanism=?self.security_mechanism.as_ref().unwrap().name(), "Negotiated security mechanism");
-
-              // Server sends its greeting in response
-              let mut greeting_to_send_buf = BytesMut::with_capacity(GREETING_LENGTH);
-              ZmtpGreeting::encode(
-                self
-                  .zmtp_config
-                  .security_mechanism_bytes_to_propose(self.is_server),
-                true,
-                &mut greeting_to_send_buf,
-              );
-              ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                data: greeting_to_send_buf.freeze(),
-                send_op_flags: 0, // The ZMTP greeting is a single, fixed-size "frame".
-                originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
-              });
-              self.phase = ZmtpHandlerPhase::ServerSendGreeting; // Expect ACK for this send
+              // Both roles proceed straight into SecurityExchange; the
+              // SecurityExchange arm below drives produce_token().
+              self.phase = ZmtpHandlerPhase::SecurityExchange;
             }
             Ok(None) => { /* Should not happen if greeting_buffer.len() == GREETING_LENGTH */ }
             Err(e) => {
@@ -335,45 +444,90 @@ impl ZmtpUringHandler {
           }
         }
 
-        // Greeting Exchange (Client waiting for Server's Greeting) - similar to above
-        ZmtpHandlerPhase::ClientWaitServerGreeting => {
-          let needed_for_greeting = GREETING_LENGTH.saturating_sub(self.greeting_buffer.len());
-          if needed_for_greeting > 0 {
+        // ZMTP/2.0: read the peer's 12th greeting byte (socket-type),
+        // validate compatibility, then send our empty identity frame.
+        ZmtpHandlerPhase::V2GreetingExchange => {
+          let needed = V2_GREETING_LENGTH.saturating_sub(self.greeting_buffer.len());
+          if needed > 0 {
             let source_buf = &mut self.network_read_accumulator;
-            let can_take = std::cmp::min(needed_for_greeting, source_buf.len());
+            let can_take = std::cmp::min(needed, source_buf.len());
             if can_take > 0 {
               self.greeting_buffer.put(source_buf.split_to(can_take));
               progress_this_iteration = true;
             }
-            if self.greeting_buffer.len() < GREETING_LENGTH {
-              break 'phase_processing_loop;
+            if self.greeting_buffer.len() < V2_GREETING_LENGTH {
+              break 'phase_processing_loop; /* Need the socket-type byte */
             }
           }
 
-          match ZmtpGreeting::decode(&mut self.greeting_buffer) {
-            Ok(Some(peer_greeting)) => {
+          let peer_stype = self.greeting_buffer[11];
+          // Consume the 12-byte v2 greeting; data frames stay buffered.
+          let _ = self.greeting_buffer.split_to(V2_GREETING_LENGTH);
+
+          if let Err(e) =
+            validate_v2_socket_type_compat(&self.zmtp_config.socket_type_name, peer_stype)
+          {
+            self.transition_to_error(ops, e.clone(), interface);
+            return Err(e);
+          }
+          if let Some(name) = socket_type_name_from_code(peer_stype) {
+            debug!(fd = self.fd, peer_socket_type = %name, "v2 peer socket-type accepted.");
+          }
+
+          // Send our empty v2 identity frame: flags=0, length=0.
+          ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
+            data: Bytes::from_static(&[0u8, 0u8]),
+            send_op_flags: 0,
+            originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+          });
+          self.phase = ZmtpHandlerPhase::V2SendIdentity;
+          progress_this_iteration = true;
+        }
+
+        // ZMTP/2.0: read the peer's identity frame, then enter the
+        // data phase. v2 has no security handshake and no READY.
+        ZmtpHandlerPhase::V2WaitIdentity => {
+          if self.network_read_accumulator.is_empty() {
+            break 'phase_processing_loop; /* Need data */
+          }
+          match self.framer.try_read_msg(&mut self.network_read_accumulator) {
+            Ok(Some(identity_msg)) => {
               progress_this_iteration = true;
-              debug!(
-                fd = self.fd,
-                role = "C",
-                ?peer_greeting,
-                "Received and decoded server greeting"
-              );
-              if self.is_server == peer_greeting.as_server {
-                let err = ZmqError::SecurityError("Role mismatch in greeting".into());
+              if identity_msg.is_command() {
+                let err = ZmqError::ProtocolViolation(
+                  "ZMTP/2.0 identity frame had COMMAND flag set".into(),
+                );
                 self.transition_to_error(ops, err.clone(), interface);
                 return Err(err);
               }
-              self.security_mechanism = Some(negotiate_security_mechanism(
-                self.is_server,
-                &self.zmtp_config,
-                &peer_greeting,
-                self.fd as usize,
-              )?);
-              info!(fd=self.fd, mechanism=?self.security_mechanism.as_ref().unwrap().name(), "Negotiated security mechanism");
-              self.phase = ZmtpHandlerPhase::SecurityExchange; // Now proceed to security token exchange
+              if identity_msg.flags().contains(MsgFlags::MORE) {
+                let err = ZmqError::ProtocolViolation(
+                  "ZMTP/2.0 identity frame had MORE flag set".into(),
+                );
+                self.transition_to_error(ops, err.clone(), interface);
+                return Err(err);
+              }
+              let id_bytes = identity_msg.data().unwrap_or(&[]);
+              if id_bytes.len() > 255 {
+                let err = ZmqError::ProtocolViolation(
+                  "ZMTP/2.0 identity frame exceeded 255 bytes".into(),
+                );
+                self.transition_to_error(ops, err.clone(), interface);
+                return Err(err);
+              }
+              if !id_bytes.is_empty() {
+                self.peer_identity_from_ready = Some(Blob::from(id_bytes.to_vec()));
+              }
+              self.phase = ZmtpHandlerPhase::DataPhase;
+              info!(
+                fd = self.fd,
+                "ZmtpUringHandler: ZMTP/2.0 handshake complete. Transitioning to DataPhase."
+              );
+              self.signal_upstream_handshake_complete(interface)?;
             }
-            Ok(None) => {}
+            Ok(None) => {
+              break 'phase_processing_loop; /* Need more data for identity frame */
+            }
             Err(e) => {
               self.transition_to_error(ops, e.clone(), interface);
               return Err(e);
@@ -693,6 +847,20 @@ impl ZmtpUringHandler {
                 self.last_activity_time = Instant::now();
 
                 if msg.is_command() {
+                  // ZMTP/2.0 has no command frames — PING/PONG and the
+                  // COMMAND flag itself postdate v2. A COMMAND-flagged
+                  // frame on a v2 session is a protocol violation.
+                  if self.negotiated_version == Some(NegotiatedVersion::V2) {
+                    warn!(
+                      fd = self.fd,
+                      "DataPhase: peer sent a COMMAND frame on a ZMTP/2.0 session."
+                    );
+                    let err = ZmqError::ProtocolViolation(
+                      "received COMMAND-flagged frame on a ZMTP/2.0 session".into(),
+                    );
+                    self.transition_to_error(ops, err.clone(), interface);
+                    return Err(err);
+                  }
                   match ZmtpCommand::parse(&msg) {
                     Some(ZmtpCommand::Ping(ping_context_payload)) => {
                       let pong_reply_msg = ZmtpCommand::create_pong(&ping_context_payload);
@@ -978,21 +1146,22 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    if self.is_server {
-      self.phase = ZmtpHandlerPhase::ServerWaitClientGreeting;
-    } else {
-      let mut greeting_to_send_buf = BytesMut::with_capacity(GREETING_LENGTH);
-      let proposed_mechanism_bytes = self
-        .zmtp_config
-        .security_mechanism_bytes_to_propose(self.is_server);
-      ZmtpGreeting::encode(proposed_mechanism_bytes, false, &mut greeting_to_send_buf);
-      ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-        data: greeting_to_send_buf.freeze(),
-        send_op_flags: 0, // Greeting is a single "frame".
-        originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
-      });
-      self.phase = ZmtpHandlerPhase::ClientSendGreeting;
-    }
+    // Staged greeting, libzmq-faithful and symmetric for both roles:
+    // write the 10-byte signature followed by our own major version
+    // byte (0x03), then peek the peer's revision in `WaitPeerRevision`
+    // before committing to a v2 or v3 tail. Byte 10 is never a
+    // "downgrade request" — it is always the sender's own major
+    // version — so it is safe to send before learning anything about
+    // the peer, and two rzmq peers doing this never deadlock.
+    let mut prelude = BytesMut::with_capacity(SIGNATURE_LENGTH + 1);
+    encode_signature(&mut prelude);
+    prelude.put_u8(GREETING_VERSION_MAJOR_BYTE);
+    ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
+      data: prelude.freeze(),
+      send_op_flags: 0,
+      originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+    });
+    self.phase = ZmtpHandlerPhase::SendSignature;
 
     ops
   }
@@ -1106,38 +1275,21 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
     let previous_phase = self.phase;
     match self.phase {
-      ZmtpHandlerPhase::ClientSendGreeting => {
-        self.phase = ZmtpHandlerPhase::ClientWaitServerGreeting;
+      // Staged-greeting send ACKs: each installment's ACK advances to
+      // the corresponding read phase. The post-block at the end of this
+      // function re-runs process_buffered_reads so any peer bytes that
+      // already arrived are processed immediately.
+      ZmtpHandlerPhase::SendSignature => {
+        self.phase = ZmtpHandlerPhase::WaitPeerRevision;
       }
-      ZmtpHandlerPhase::ServerSendGreeting => {
-        self.phase = ZmtpHandlerPhase::SecurityExchange;
-        if let Some(sec_mech) = self.security_mechanism.as_mut() {
-          if let Ok(Some(token_vec)) = sec_mech.produce_token() {
-            // produce_token() decides if it's turn.
-            let token_msg = Msg::from_vec(token_vec).with_flags(MsgFlags::COMMAND);
-
-            // Modified to use Framer
-            match self.framer.write_msg_multipart(vec![token_msg]) {
-              Ok(bytes) => {
-                ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                  data: bytes,
-                  send_op_flags: 0, // Security tokens are ZMTP command frames, usually single.
-                  originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD, // Internal protocol message.
-                });
-              }
-              Err(err) => {
-                let err = ZmqError::Internal(format!(
-                  "Failed to encode/encrypt server security token: {}",
-                  err
-                ));
-                let mut temp_ops = std::mem::take(&mut ops);
-                self.transition_to_error(&mut temp_ops, err, interface);
-                ops = temp_ops;
-                return ops;
-              }
-            }
-          }
-        }
+      ZmtpHandlerPhase::SendV3Tail => {
+        self.phase = ZmtpHandlerPhase::WaitV3Greeting;
+      }
+      ZmtpHandlerPhase::SendV2Tail => {
+        self.phase = ZmtpHandlerPhase::V2GreetingExchange;
+      }
+      ZmtpHandlerPhase::V2SendIdentity => {
+        self.phase = ZmtpHandlerPhase::V2WaitIdentity;
       }
       ZmtpHandlerPhase::SecurityExchange | ZmtpHandlerPhase::Closing => {}
       ZmtpHandlerPhase::ReadyClientSend => {
@@ -1348,7 +1500,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
               }
             }
           } else if let Some(ivl) = self.heartbeat_ivl {
-            if now.duration_since(self.last_activity_time) >= ivl {
+            // ZMTP/2.0 has no PING/PONG commands — suppress heartbeats
+            // on a v2 session and rely on TCP keepalive instead.
+            let is_v2 = self.negotiated_version == Some(NegotiatedVersion::V2);
+            if !is_v2 && now.duration_since(self.last_activity_time) >= ivl {
               debug!(fd = self.fd, "Heartbeat interval elapsed. Preparing PING.");
               let ping_msg = ZmtpCommand::create_ping(0, b"hb_ping");
 
@@ -1573,6 +1728,43 @@ impl UringConnectionHandler for ZmtpUringHandler {
       );
     }
   }
+}
+
+/// Refuse v2 sessions where the peer's socket type cannot interoperate
+/// with ours. Conservative: only the canonical bidirectional pairs are
+/// allowed. Mirrors `sessionx::protocol_handler::v2_path`.
+fn validate_v2_socket_type_compat(own_name: &str, peer_byte: u8) -> Result<(), ZmqError> {
+  let peer_name = socket_type_name_from_code(peer_byte).ok_or_else(|| {
+    ZmqError::ProtocolViolation(format!(
+      "v2 peer advertised unknown socket-type byte {:#04x}",
+      peer_byte
+    ))
+  })?;
+  let ok = matches!(
+    (own_name, peer_byte),
+    ("PULL", V2_SOCKET_TYPE_PUSH)
+      | ("PUSH", V2_SOCKET_TYPE_PULL)
+      | ("PUB", V2_SOCKET_TYPE_SUB)
+      | ("SUB", V2_SOCKET_TYPE_PUB)
+      | ("REQ", V2_SOCKET_TYPE_REP)
+      | ("REP", V2_SOCKET_TYPE_REQ)
+      | ("REQ", V2_SOCKET_TYPE_ROUTER)
+      | ("ROUTER", V2_SOCKET_TYPE_REQ)
+      | ("REP", V2_SOCKET_TYPE_DEALER)
+      | ("DEALER", V2_SOCKET_TYPE_REP)
+      | ("DEALER", V2_SOCKET_TYPE_ROUTER)
+      | ("ROUTER", V2_SOCKET_TYPE_DEALER)
+      | ("DEALER", V2_SOCKET_TYPE_DEALER)
+      | ("ROUTER", V2_SOCKET_TYPE_ROUTER)
+      | ("PAIR", V2_SOCKET_TYPE_PAIR)
+  );
+  if !ok {
+    return Err(ZmqError::ProtocolViolation(format!(
+      "incompatible ZMTP/2.0 socket pairing: local {} ↔ peer {}",
+      own_name, peer_name
+    )));
+  }
+  Ok(())
 }
 
 pub struct ZmtpHandlerFactory {}
