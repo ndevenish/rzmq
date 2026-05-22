@@ -66,6 +66,9 @@ Provides a `Context` for managing sockets and a `Socket` handle with async metho
 ### ZMTP 3.1 Protocol Basics
 Implements core aspects of the ZeroMQ Message Transport Protocol version 3.1, including Greeting, Framing, READY command, and PING/PONG keepalives.
 
+### ZMTP/2.0 Downgrade
+On the **connect** side, `rzmq` performs libzmq-style staged greeting negotiation: it sends the 10-byte signature plus its own major version, then inspects the peer's advertised revision. If the peer is **ZMTP/2.0-only** (revision `0x01` — e.g. libzmq 3.x-era peers, or hardware that predates ZMTP/3.x), `rzmq` transparently downgrades that connection to ZMTP/2.0 (12-byte greeting, anonymous identity exchange, no security handshake, no PING/PONG — TCP keepalive is relied on instead). ZMTP/3.x peers negotiate v3 exactly as before. The downgrade is on by default and can be disabled per socket with the `ZMTP2_ALLOWED` option (set to `0`) for strict v3-only deployments. ZMTP/1.0 is not supported. Both the standard Tokio transport path and the optional `io_uring` backend implement the downgrade.
+
 ### Common Socket Options
 Supports a range of common socket options for fine-tuning behavior, including:
 *   High-Water Marks: `SNDHWM`, `RCVHWM`
@@ -79,6 +82,8 @@ Supports a range of common socket options for fine-tuning behavior, including:
     *   `PLAIN_SERVER`, `PLAIN_USERNAME`, `PLAIN_PASSWORD` (requires `plain` feature)
     *   `CURVE_SERVER`, `CURVE_SECRET_KEY`, `CURVE_SERVER_KEY` (requires `curve` feature)
     *   `NOISE_XX_ENABLED`, `NOISE_XX_STATIC_SECRET_KEY`, `NOISE_XX_REMOTE_STATIC_PUBLIC_KEY` (requires `noise_xx` feature)
+*   Protocol:
+    *   `ZMTP2_ALLOWED` (allow downgrade to ZMTP/2.0 for v2-only peers; default enabled)
 *   Performance/Platform-Specific (`io-uring` feature, Linux-only):
     *   `IO_URING_SESSION_ENABLED` (to enable io_uring for a socket's connections)
     *   `TCP_CORK`

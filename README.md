@@ -39,7 +39,7 @@
     *   `tcp://` (IPv4/IPv6), with an optional high-performance `io_uring` backend on Linux.
     *   `ipc://` (Unix Domain Sockets, `ipc` feature, Unix-like systems).
     *   `inproc://` (In-process, `inproc` feature).
-*   **ZMTP 3.1 Protocol:** Core elements including Greeting, Framing, READY, PING/PONG.
+*   **ZMTP 3.1 Protocol:** Core elements including Greeting, Framing, READY, PING/PONG. The connect side also negotiates a **ZMTP/2.0 downgrade** for v2-only peers (opt-out via the `ZMTP2_ALLOWED` socket option).
 *   **Common Socket Options:**
     *   Watermarks (`SNDHWM`, `RCVHWM`), Timeouts (`SNDTIMEO`, `RCVTIMEO`, `LINGER`), Reconnection (`RECONNECT_IVL`, `RECONNECT_IVL_MAX`), TCP Keepalives, `LAST_ENDPOINT`.
     *   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE`, `ROUTING_ID`, `ROUTER_MANDATORY`.
