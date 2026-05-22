@@ -101,6 +101,20 @@ pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
     return Ok(());
   }
 
+  // ZMTP/2.0 has no command frames. A bug elsewhere queueing a
+  // COMMAND-flagged message on a v2 session would put garbage on the
+  // wire that the peer would misparse as data. Catch it here in debug
+  // builds; the v2 heartbeat suppression should prevent it in release.
+  if handler
+    .negotiated_version
+    .map_or(false, |v| v.is_v2())
+  {
+    debug_assert!(
+      !msgs.iter().any(|m| m.flags().contains(crate::MsgFlags::COMMAND)),
+      "tried to encode a COMMAND-flagged frame on a ZMTP/2.0 session"
+    );
+  }
+
   let stream = handler
     .stream
     .as_mut()

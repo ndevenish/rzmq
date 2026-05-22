@@ -533,7 +533,23 @@ where
       .expect("Cannot handle incoming message without core_pipe_read_id");
 
     if msg.is_command() {
-      // Process PING/PONG
+      // ZMTP/2.0 has no commands. Receiving a COMMAND-flagged frame
+      // from a v2 peer is a protocol violation — the peer either
+      // misframed a data frame or is mismatched against our
+      // negotiated_version. Don't try to decode it as PING/PONG.
+      if self
+        .zmtp_handler
+        .negotiated_version
+        .map_or(false, |v| v.is_v2())
+      {
+        self
+          .set_fatal_error(ZmqError::ProtocolViolation(
+            "received COMMAND-flagged frame on a ZMTP/2.0 session".into(),
+          ))
+          .await;
+        return;
+      }
+      // Process PING/PONG (v3 only)
       match self.zmtp_handler.process_incoming_data_command_frame(&msg) {
         Ok(Some(pong_reply)) => {
           if let Err(e) = self.zmtp_handler.write_data_msg(pong_reply, true).await {

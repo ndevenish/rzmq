@@ -135,6 +135,15 @@ pub(crate) fn process_heartbeat_command_impl<S: ZmtpStdStream>(
 pub(crate) async fn try_send_ping_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
 ) -> Result<(), ZmqError> {
+  // ZMTP/2.0 has no command frames — PING/PONG didn't exist until v3.
+  // On a v2 session, suppress PING entirely and rely on TCP keepalive
+  // (set via TCP_KEEPALIVE socket options) for dead-peer detection.
+  if handler
+    .negotiated_version
+    .map_or(false, |v| v.is_v2())
+  {
+    return Ok(());
+  }
   if handler.heartbeat_state.should_send_ping(Instant::now()) {
     tracing::debug!(
       sca_handle = handler.actor_handle,
