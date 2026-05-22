@@ -26,6 +26,12 @@ pub const HANDSHAKE_IVL: i32 = 41; // ZMQ_HANDSHAKE_IVL
 pub const ROUTER_MANDATORY: i32 = 33;
 pub const AUTO_DELIMITER: i32 = 42; // Router/Dealer Auto Delimiter insertion/stripping handling. Enabled by default.
 
+/// Socket option: allow the connect side to downgrade its outgoing
+/// greeting to ZMTP/2.0 when the peer advertises revision 0x01.
+/// Value is i32 (0 or 1); default 1 (enabled). Set to 0 for strict
+/// ZMTP/3.x-only deployments. rzmq-specific — no libzmq equivalent.
+pub const ZMTP2_ALLOWED: i32 = 1180;
+
 // Security Options
 /// Not used currently
 pub const ZAP_DOMAIN: i32 = 55; //TODO  will remove if 100% sure ZAP won't be impl
@@ -89,6 +95,12 @@ pub(crate) struct SocketOptions {
   /// Maximum inbound frame size in bytes. -1 means unlimited.
   pub maxmsgsize: i64,
 
+  /// Whether this socket is allowed to downgrade its outgoing greeting
+  /// to ZMTP/2.0 when the peer advertises revision 0x01. Default is
+  /// `true` — strict v3-only deployments can opt out. Mirrors
+  /// libzmq's wire behaviour (libzmq always allows v2 downgrade).
+  pub allow_zmtp2: bool,
+
   /// Interval between sending ZMTP PING probes if no traffic received.
   /// `None` disables PINGs.
   pub heartbeat_ivl: Option<Duration>,
@@ -133,6 +145,7 @@ impl Default for SocketOptions {
       tcp_nodelay: true, // Common default for messaging
       max_connections: Some(1024),
       maxmsgsize: -1,      // -1 = unlimited
+      allow_zmtp2: true,   // Allow downgrade to ZMTP/2.0 by default
       heartbeat_ivl: None, // Disabled by default
       heartbeat_timeout: None,
       handshake_ivl: None,
@@ -237,6 +250,9 @@ pub(crate) struct ZmtpEngineConfig {
   pub plain_password_for_engine: Option<String>,
   /// Maximum inbound frame size in bytes. -1 means unlimited.
   pub max_msg_size: i64,
+  /// See [`SocketOptions::allow_zmtp2`]. Carried into the engine so
+  /// the handshake state machine can refuse v2 if disabled.
+  pub allow_zmtp2: bool,
 }
 
 impl From<&SocketOptions> for ZmtpEngineConfig {
@@ -284,6 +300,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       plain_username_for_engine: options.plain_options.username.clone(),
       plain_password_for_engine: options.plain_options.password.clone(),
       max_msg_size: options.maxmsgsize,
+      allow_zmtp2: options.allow_zmtp2,
     }
   }
 }
@@ -516,6 +533,7 @@ pub(crate) fn apply_core_option_value(
         MAXMSGSIZE => options.maxmsgsize = parse_maxmsgsize_option(value)?,
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
         TCP_CORK => options.tcp_cork = parse_bool_option(value)?,
+        ZMTP2_ALLOWED => options.allow_zmtp2 = parse_bool_option(value)?,
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
         PLAIN_SERVER => {
             options.plain_options.server_role = Some(parse_bool_option(value)?);
@@ -597,6 +615,7 @@ pub(crate) fn retrieve_core_option_value(
         MAXMSGSIZE => Ok(options.maxmsgsize.to_ne_bytes().to_vec()),
         MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
         TCP_CORK => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
+        ZMTP2_ALLOWED => Ok((options.allow_zmtp2 as i32).to_ne_bytes().to_vec()),
         ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),
         PLAIN_SERVER => options.plain_options.server_role.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_SERVER not set".into())),
         PLAIN_USERNAME => options.plain_options.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_USERNAME not set".into())),
